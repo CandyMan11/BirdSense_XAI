@@ -1,0 +1,2 @@
+# BirdSense-XAI dataset step uses the Python 3.10+ standard library only.
+# No third-party packages are required.
