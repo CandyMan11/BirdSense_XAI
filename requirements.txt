@@ -1,2 +1,3 @@
-# BirdSense-XAI dataset step uses the Python 3.10+ standard library only.
-# No third-party packages are required.
+# Dataset download uses the Python 3.10+ standard library only.
+# Training also uses the packages already installed in this environment:
+# torch, torchvision, numpy, Pillow, librosa, soundfile, av
