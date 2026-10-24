@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BirdSense-XAI</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1c2416;
+      --muted: #5c6756;
+      --line: #d9d3c7;
+      --paper: #f6f3ec;
+      --card: #fffdf8;
+      --green: #1f6b45;
+      --green-soft: #e5f2ea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { font-size: 1.8rem; margin: 0 0 6px; }
+    h2 { font-size: 1rem; margin: 0 0 12px; }
+    p { line-height: 1.45; }
+    .lede { color: var(--muted); max-width: 720px; margin-top: 0; }
+    .metrics { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 22px; }
+    .metric {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 14px;
+      min-width: 140px;
+    }
+    .metric b { display: block; font-size: 1.25rem; }
+    .metric span { color: var(--muted); font-size: 0.85rem; }
+    .pickers { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
+    select, button {
+      font: inherit;
+      color: var(--ink);
+    }
+    select { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .preview {
+      margin-top: 12px;
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      background: #f0ece3;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    img, audio { width: 100%; }
+    img { max-height: 320px; object-fit: contain; background: #111; }
+    .actions { display: flex; gap: 10px; margin: 16px 0; }
+    button {
+      background: var(--green);
+      color: white;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    button.secondary { background: white; color: var(--ink); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .result { margin-top: 8px; }
+    .call { font-size: 1.7rem; margin: 0; }
+    .sub { color: var(--muted); margin: 4px 0 14px; }
+    .bars { display: grid; gap: 8px; }
+    .bar-row { display: grid; grid-template-columns: minmax(140px, 190px) 1fr 52px; gap: 8px; align-items: center; }
+    .track { height: 10px; background: #ece7dc; border-radius: 999px; overflow: hidden; }
+    .fill { height: 100%; background: var(--green); }
+    .trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px; }
+    .trio .card { background: var(--green-soft); }
+    .error { color: #8d2a2a; }
+    @media (max-width: 800px) {
+      .pickers, .trio { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>BirdSense-XAI</h1>
+    <p class="lede">Pick one photo and one recording. The page runs the saved photo model, the saved recording model, and the fusion layer. It does not retrain, and it does not recompute the test score.</p>
+    <section class="metrics" id="metrics"></section>
+    <section class="pickers">
+      <div class="card">
+        <h2>Photo</h2>
+        <label for="image-species">Species filter</label>
+        <select id="image-species"></select>
+        <label for="image-file">File</label>
+        <select id="image-file"></select>
+        <div class="preview" id="image-preview"></div>
+      </div>
+      <div class="card">
+        <h2>Recording</h2>
+        <label for="audio-species">Species filter</label>
+        <select id="audio-species"></select>
+        <label for="audio-file">File</label>
+        <select id="audio-file"></select>
+        <div class="preview" id="audio-preview"></div>
+      </div>
+    </section>
+    <div class="actions">
+      <button id="predict" type="button">Predict species</button>
+      <button id="random-val" class="secondary" type="button">Load a validation pair</button>
+    </div>
+    <p id="status"></p>
+    <section class="card result" id="result" hidden>
+      <p class="call" id="call"></p>
+      <p class="sub" id="call-detail"></p>
+      <div class="bars" id="bars"></div>
+      <div class="trio">
+        <div class="card"><h2>Photo model</h2><p id="image-call"></p></div>
+        <div class="card"><h2>Recording model</h2><p id="audio-call"></p></div>
+        <div class="card"><h2>Contribution to the fused call</h2><p id="contrib"></p></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const state = { files: [], species: [] };
+
+    function optionLabel(file) {
+      const name = file.file_path.split("/").pop();
+      const broken = file.decodable === "no" ? " · undecodable" : "";
+      return `${file.split} · ${name}${broken}`;
+    }
+
+    function fillSpecies(select) {
+      select.innerHTML = state.species.map((species) =>
+        `<option value="${species.common}">${species.common}</option>`
+      ).join("");
+    }
+
+    function fillFiles(select, modality, species) {
+      const files = state.files.filter((file) => file.modality === modality && file.common_name === species);
+      select.innerHTML = files.map((file) =>
+        `<option value="${file.sample_id}" ${file.decodable === "no" ? "disabled" : ""}>${optionLabel(file)}</option>`
+      ).join("");
+      return files.find((file) => file.decodable !== "no");
+    }
+
+    function selectedFile(select) {
+      return state.files.find((file) => file.sample_id === select.value);
+    }
+
+    function showPreview() {
+      const image = selectedFile(document.getElementById("image-file"));
+      const audio = selectedFile(document.getElementById("audio-file"));
+      const imageBox = document.getElementById("image-preview");
+      const audioBox = document.getElementById("audio-preview");
+      imageBox.innerHTML = image ? `<img alt="${image.common_name}" src="/file?path=${encodeURIComponent(image.file_path)}">` : "";
+      audioBox.innerHTML = audio ? `<audio controls src="/file?path=${encodeURIComponent(audio.file_path)}"></audio>` : "";
+    }
+
+    function percent(value) {
+      return `${Math.round(value * 1000) / 10}%`;
+    }
+
+    function render(result) {
+      document.getElementById("result").hidden = false;
+      document.getElementById("call").textContent = result.fused.species;
+      const fileNote = result.same_species_files
+        ? `Both files are labeled ${result.file_species.image}.`
+        : `The photo is labeled ${result.file_species.image} and the recording is labeled ${result.file_species.audio}.`;
+      document.getElementById("call-detail").textContent =
+        `${result.fused.scientific} · fused probability ${percent(result.fused.probability)} after temperature ${result.temperature}. ${fileNote}`;
+      document.getElementById("bars").innerHTML = result.ranking.map((row) => `
+        <div class="bar-row">
+          <span>${row.species}</span>
+          <div class="track"><div class="fill" style="width:${Math.max(2, row.probability * 100)}%"></div></div>
+          <span>${percent(row.probability)}</span>
+        </div>
+      `).join("");
+      document.getElementById("image-call").textContent =
+        `${result.image_only.species} · ${percent(result.image_only.probability)}`;
+      document.getElementById("audio-call").textContent =
+        `${result.audio_only.species} · ${percent(result.audio_only.probability)}`;
+      const part = result.contribution;
+      document.getElementById("contrib").textContent =
+        `Photo scores ${part.image.toFixed(2)}, recording scores ${part.audio.toFixed(2)}, bias ${part.bias.toFixed(2)}. These add up to the fused score for ${result.fused.species} before calibration.`;
+    }
+
+    async function predict() {
+      const button = document.getElementById("predict");
+      const status = document.getElementById("status");
+      button.disabled = true;
+      status.textContent = "Running the photo model, the recording model, and the fusion layer.";
+      status.className = "";
+      try {
+        const response = await fetch("/api/predict", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            image_id: document.getElementById("image-file").value,
+            audio_id: document.getElementById("audio-file").value,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "prediction failed");
+        render(payload);
+        status.textContent = "";
+      } catch (error) {
+        status.textContent = error.message;
+        status.className = "error";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function chooseValPair() {
+      const species = state.species[Math.floor(Math.random() * state.species.length)].common;
+      document.getElementById("image-species").value = species;
+      document.getElementById("audio-species").value = species;
+      fillFiles(document.getElementById("image-file"), "image", species);
+      fillFiles(document.getElementById("audio-file"), "audio", species);
+      const image = state.files.find((file) => file.modality === "image" && file.split === "val" && file.common_name === species);
+      const audio = state.files.find((file) => file.modality === "audio" && file.split === "val" && file.common_name === species && file.decodable !== "no");
+      if (image) document.getElementById("image-file").value = image.sample_id;
+      if (audio) document.getElementById("audio-file").value = audio.sample_id;
+      showPreview();
+    }
+
+    async function init() {
+      const [catalog, summary] = await Promise.all([
+        fetch("/api/catalog").then((response) => response.json()),
+        fetch("/api/summary").then((response) => response.json()),
+      ]);
+      state.files = catalog.files;
+      state.species = catalog.species;
+      document.getElementById("metrics").innerHTML = `
+        <div class="metric"><b>${percent(Number(summary.test_accuracy))}</b><span>Recorded test accuracy</span></div>
+        <div class="metric"><b>${percent(Number(summary.val_fusion))}</b><span>Validation, fused</span></div>
+        <div class="metric"><b>${percent(Number(summary.val_image))}</b><span>Validation, photo only</span></div>
+        <div class="metric"><b>${summary.temperature}</b><span>Calibration temperature</span></div>
+      `;
+      fillSpecies(document.getElementById("image-species"));
+      fillSpecies(document.getElementById("audio-species"));
+      for (const [speciesId, fileId, modality] of [
+        ["image-species", "image-file", "image"],
+        ["audio-species", "audio-file", "audio"],
+      ]) {
+        const speciesSelect = document.getElementById(speciesId);
+        const fileSelect = document.getElementById(fileId);
+        const refresh = () => {
+          fillFiles(fileSelect, modality, speciesSelect.value);
+          showPreview();
+        };
+        speciesSelect.addEventListener("change", refresh);
+        fileSelect.addEventListener("change", showPreview);
+        refresh();
+      }
+      chooseValPair();
+      document.getElementById("predict").addEventListener("click", predict);
+      document.getElementById("random-val").addEventListener("click", chooseValPair);
+    }
+
+    init();
+  </script>
+</body>
+</html>
