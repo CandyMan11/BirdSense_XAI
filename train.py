@@ -32,6 +32,8 @@ MEL_CACHE = ROOT / "data" / "cache" / "mel"
 
 SAMPLE_RATE = 22050
 CLIP_SECONDS = 3.0
+MAX_AUDIO_WINDOWS = 8
+MAX_AUDIO_SECONDS = 120.0
 N_MELS = 64
 MEL_FRAMES = 128
 IMAGE_EPOCHS = 6
@@ -93,7 +95,7 @@ class ImageSet(Dataset):
         return tensor, LABEL_TO_INDEX[row["common_name"]]
 
 
-def decode_with_av(path: Path, need: int) -> np.ndarray:
+def decode_with_av(path: Path, need: int, pad: bool = True) -> np.ndarray:
     container = av.open(str(path))
     resampler = av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
     chunks: list[np.ndarray] = []
@@ -122,7 +124,10 @@ def decode_with_av(path: Path, need: int) -> np.ndarray:
         container.close()
     if not chunks:
         raise RuntimeError(f"no audio frames in {path}")
-    return fit_length(np.concatenate(chunks), need)
+    audio = np.concatenate(chunks).astype(np.float32)
+    if not pad:
+        return audio[:need]
+    return fit_length(audio, need)
 
 
 def decode_clip(path: Path) -> np.ndarray:
@@ -150,6 +155,50 @@ def decode_clip(path: Path) -> np.ndarray:
     raise RuntimeError("; ".join(errors))
 
 
+def decode_capped(path: Path, max_samples: int) -> np.ndarray:
+    """Return up to max_samples of mono audio. Short files are not padded."""
+    errors: list[str] = []
+    if path.suffix.lower() == ".wav":
+        try:
+            audio, file_sr = sf.read(path, dtype="float32", always_2d=True)
+            audio = audio.mean(axis=1)
+            if file_sr != SAMPLE_RATE:
+                audio = librosa.resample(audio, orig_sr=file_sr, target_sr=SAMPLE_RATE)
+            return np.asarray(audio[:max_samples], dtype=np.float32)
+        except Exception as exc:
+            errors.append(f"soundfile: {exc}")
+    try:
+        return decode_with_av(path, max_samples, pad=False)
+    except Exception as exc:
+        errors.append(f"av: {exc}")
+    try:
+        audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True, duration=max_samples / SAMPLE_RATE)
+        return np.asarray(audio[:max_samples], dtype=np.float32)
+    except Exception as exc:
+        errors.append(f"librosa: {exc}")
+    raise RuntimeError("; ".join(errors))
+
+
+def extra_window_starts(n_samples: int, window: int, max_windows: int) -> list[int]:
+    """Starts after the opening window. At most max_windows - 1, spread across the file."""
+    if n_samples <= window or max_windows < 2:
+        return []
+    extras = min(max_windows - 1, int(np.ceil(n_samples / window)) - 1)
+    if extras <= 0:
+        return []
+    last = n_samples - window
+    if extras == 1:
+        return [int(last)] if last >= window // 2 else []
+    starts: list[int] = []
+    for index in range(1, extras + 1):
+        start = int(round(index * last / extras))
+        if start < window // 2:
+            continue
+        if not starts or start != starts[-1]:
+            starts.append(start)
+    return starts
+
+
 def fit_length(audio: np.ndarray, need: int) -> np.ndarray:
     if audio.shape[0] < need:
         return np.pad(audio, (0, need - audio.shape[0]))
@@ -170,6 +219,20 @@ def log_mel(audio: np.ndarray) -> np.ndarray:
     if decibels.shape[1] < MEL_FRAMES:
         decibels = np.pad(decibels, ((0, 0), (0, MEL_FRAMES - decibels.shape[1])))
     return decibels[:, :MEL_FRAMES]
+
+
+def mel_image_tensor(mel: np.ndarray) -> torch.Tensor:
+    """Turn one log-mel into the 3-channel image the recording MobileNet scores."""
+    tensor = torch.from_numpy(np.ascontiguousarray(mel)).unsqueeze(0).unsqueeze(0)
+    tensor = torch.nn.functional.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
+    tensor = tensor.squeeze(0).repeat(3, 1, 1)
+    low = torch.quantile(tensor, 0.01)
+    high = torch.quantile(tensor, 0.99)
+    tensor = (tensor - low) / (high - low + 1e-6)
+    tensor = tensor.clamp(0, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+    return (tensor - mean) / std
 
 
 def cache_mel(row: dict[str, str]) -> Path:
@@ -301,20 +364,34 @@ class MelImageSet(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
         row = self.rows[index]
-        mel = np.load(cache_mel(row))
-        tensor = torch.from_numpy(np.ascontiguousarray(mel)).unsqueeze(0).unsqueeze(0)
-        tensor = torch.nn.functional.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
-        tensor = tensor.squeeze(0).repeat(3, 1, 1)
-        low = torch.quantile(tensor, 0.01)
-        high = torch.quantile(tensor, 0.99)
-        tensor = (tensor - low) / (high - low + 1e-6)
-        tensor = tensor.clamp(0, 1)
-        mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
-        std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
-        tensor = (tensor - mean) / std
+        tensor = mel_image_tensor(np.load(cache_mel(row)))
         if self.train and torch.rand(1).item() < 0.5:
             tensor = torch.flip(tensor, dims=[2])
         return tensor, LABEL_TO_INDEX[row["common_name"]]
+
+
+def audio_window_logits(model: nn.Module, row: dict[str, str]) -> tuple[np.ndarray, int]:
+    """Average the saved recording model over 3-second windows.
+
+    The first window is the same clip the model was trained on. Later windows
+    are spread across the rest of the file, up to MAX_AUDIO_WINDOWS in total
+    and MAX_AUDIO_SECONDS of audio.
+    """
+    first, _label = MelImageSet([row], train=False)[0]
+    window = int(SAMPLE_RATE * CLIP_SECONDS)
+    tensors = [first]
+    try:
+        audio = decode_capped(ROOT / row["file_path"], int(SAMPLE_RATE * MAX_AUDIO_SECONDS))
+        for start in extra_window_starts(int(audio.shape[0]), window, MAX_AUDIO_WINDOWS):
+            chunk = fit_length(audio[start : start + window], window)
+            tensors.append(mel_image_tensor(log_mel(chunk)))
+    except Exception as exc:
+        print(f"extra windows skipped {row['file_path']}: {exc}", flush=True)
+        tensors = [first]
+    batch = torch.stack(tensors)
+    with torch.no_grad():
+        averaged = model(batch).mean(dim=0)
+    return averaged.numpy().astype(np.float32), len(tensors)
 
 
 def run_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer | None) -> tuple[float, float]:

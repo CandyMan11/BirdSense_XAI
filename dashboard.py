@@ -17,14 +17,24 @@ import torch
 import torch.nn.functional as F
 
 from download_dataset import SPECIES
-from fuse import LogitFuse
-from train import LABELS, LABEL_TO_INDEX, ROOT, ImageSet, MelImageSet, audio_mobilenet, image_model
+from fuse import LogitFuse, load_mean_window_logits
+from train import (
+    LABELS,
+    LABEL_TO_INDEX,
+    ROOT,
+    ImageSet,
+    MelImageSet,
+    audio_mobilenet,
+    audio_window_logits,
+    image_model,
+)
 
 PORT = 8765
 RAW_ROOT = (ROOT / "data" / "raw").resolve()
 SPLITS_PATH = ROOT / "data" / "metadata" / "splits.csv"
 SKIP_PATH = ROOT / "data" / "metadata" / "audio_decode_skips.csv"
 RESULTS_PATH = ROOT / "data" / "metadata" / "fusion_results.csv"
+SPECIES_PATH = ROOT / "data" / "metadata" / "fusion_test_by_species.csv"
 PAGE_PATH = ROOT / "dashboard" / "index.html"
 
 SCIENTIFIC = {common: scientific for common, scientific in SPECIES}
@@ -37,6 +47,9 @@ IMAGE_NET = None
 AUDIO_NET = None
 FUSION_NET = None
 TEMPERATURE = 1.0
+AUDIO_POOLING = "first_window"
+WINDOW_LOGITS: dict[str, torch.Tensor] = {}
+WINDOW_COUNTS: dict[str, int] = {}
 
 
 def load_catalog() -> None:
@@ -61,7 +74,7 @@ def load_catalog() -> None:
 
 
 def load_models() -> None:
-    global IMAGE_NET, AUDIO_NET, FUSION_NET, TEMPERATURE
+    global IMAGE_NET, AUDIO_NET, FUSION_NET, TEMPERATURE, AUDIO_POOLING
     IMAGE_NET = image_model()
     image_checkpoint = torch.load(ROOT / "models" / "image_best.pt", map_location="cpu", weights_only=False)
     IMAGE_NET.load_state_dict(image_checkpoint["state_dict"])
@@ -77,20 +90,55 @@ def load_models() -> None:
     FUSION_NET.load_state_dict(fusion_checkpoint["state_dict"])
     FUSION_NET.eval()
     TEMPERATURE = float(fusion_checkpoint["temperature"])
+    AUDIO_POOLING = str(fusion_checkpoint.get("audio_pooling", "first_window"))
+    WINDOW_LOGITS.clear()
+    WINDOW_COUNTS.clear()
+    if AUDIO_POOLING == "mean_windows":
+        for split_name in ("train", "val", "calib", "test"):
+            for sample_id, (logits, count) in load_mean_window_logits(split_name).items():
+                WINDOW_LOGITS[sample_id] = torch.from_numpy(logits)
+                WINDOW_COUNTS[sample_id] = count
 
 
-def recorded_summary() -> dict[str, str]:
-    summary = {"test_accuracy": "", "val_fusion": "", "val_image": "", "temperature": f"{TEMPERATURE:.1f}"}
+def species_test_table() -> dict[str, dict[str, float | int]]:
+    table: dict[str, dict[str, float | int]] = {}
+    if not SPECIES_PATH.is_file():
+        return table
+    with SPECIES_PATH.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            table[row["common_name"]] = {"accuracy": float(row["accuracy"]), "n": int(row["n"])}
+    return table
+
+
+def recorded_summary() -> dict[str, object]:
+    summary: dict[str, object] = {
+        "test_accuracy": "",
+        "val_fusion": "",
+        "val_image": "",
+        "temperature": f"{TEMPERATURE:.1f}",
+        "audio_pooling": AUDIO_POOLING,
+        "species_test": species_test_table(),
+    }
     if not RESULTS_PATH.is_file():
         return summary
+    test_accuracy = ""
+    window_test = ""
+    val_fusion = ""
+    window_val = ""
     with RESULTS_PATH.open(encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
-            if row["stage"] == "test":
-                summary["test_accuracy"] = row["accuracy"]
+            if row["stage"] == "test" and row["system"] == "linear":
+                test_accuracy = row["accuracy"]
+            elif row["stage"] == "test" and row["system"] == "linear_windows":
+                window_test = row["accuracy"]
             elif row["stage"] == "val" and row["system"] == "linear":
-                summary["val_fusion"] = row["accuracy"]
+                val_fusion = row["accuracy"]
+            elif row["stage"] == "val" and row["system"] == "linear_windows" and row["note"].startswith("adopted"):
+                window_val = row["accuracy"]
             elif row["stage"] == "val" and row["system"] == "image_only":
                 summary["val_image"] = row["accuracy"]
+    summary["test_accuracy"] = window_test or test_accuracy
+    summary["val_fusion"] = window_val or val_fusion
     return summary
 
 
@@ -138,9 +186,19 @@ def predict(image_id: str, audio_id: str) -> dict[str, object]:
         raise ValueError("that recording could not be decoded")
 
     image_tensor, _label = ImageSet([image_row], train=False)[0]
-    audio_tensor, _label = MelImageSet([audio_row], train=False)[0]
     image_logits = IMAGE_NET(image_tensor.unsqueeze(0))
-    audio_logits = AUDIO_NET(audio_tensor.unsqueeze(0))
+    if AUDIO_POOLING == "mean_windows" and audio_id in WINDOW_LOGITS:
+        audio_logits = WINDOW_LOGITS[audio_id].unsqueeze(0)
+        n_windows = WINDOW_COUNTS.get(audio_id, 1)
+    elif AUDIO_POOLING == "mean_windows":
+        averaged, n_windows = audio_window_logits(AUDIO_NET, audio_row)
+        audio_logits = torch.from_numpy(averaged).unsqueeze(0)
+        WINDOW_LOGITS[audio_id] = audio_logits[0]
+        WINDOW_COUNTS[audio_id] = n_windows
+    else:
+        audio_tensor, _label = MelImageSet([audio_row], train=False)[0]
+        audio_logits = AUDIO_NET(audio_tensor.unsqueeze(0))
+        n_windows = 1
     fused_logits = FUSION_NET(image_logits, audio_logits)
     fused_probabilities = torch.softmax(fused_logits / TEMPERATURE, dim=1)[0]
     image_probabilities = torch.softmax(image_logits, dim=1)[0]
@@ -158,6 +216,8 @@ def predict(image_id: str, audio_id: str) -> dict[str, object]:
         "ranking": ranking(fused_probabilities),
         "contribution": {"image": image_part, "audio": audio_part, "bias": bias},
         "temperature": TEMPERATURE,
+        "audio_pooling": AUDIO_POOLING,
+        "n_windows": n_windows,
         "image_split": image_row["split"],
         "audio_split": audio_row["split"],
         "same_species_files": image_row["common_name"] == audio_row["common_name"],
