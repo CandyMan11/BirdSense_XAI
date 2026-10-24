@@ -1,6 +1,5 @@
-Paste everything inside the fence. The file is already saved locally as `README.md`.
+The titles were sitting inside a code block, so GitHub showed the `#` marks as plain text. Paste the text below into the README editor with no code fence around it. The `#` lines become the large titles.
 
-````markdown
 # BirdSense-XAI
 
 BirdSense-XAI classifies 20 bird species from a photo, a recording, or both. A photo model and a recording model are trained separately. A fusion layer then combines their scores. A local dashboard runs a single pair and shows which source the fused call followed.
@@ -130,4 +129,3 @@ Open http://127.0.0.1:8765. It needs the downloaded files plus `models/image_bes
 | `data/cache/` | Mel spectrograms and cached logits |
 
 `data/` is listed in `.gitignore`.
-````
