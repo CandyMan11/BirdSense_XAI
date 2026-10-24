@@ -4,11 +4,15 @@ Photos and recordings come from different observations, so a training pair is
 one photo and one recording of the same species from the same split.
 The fusion rule is chosen on val. Temperature is fit on calib.
 The test split is scored once, after that choice is fixed.
+`python fuse.py windows` may score it one more time, and only if
+whole-file recording windows beat the saved validation accuracy.
 """
 
 from __future__ import annotations
 
 import csv
+import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +40,8 @@ SPECIES_PATH = ROOT / "data" / "metadata" / "fusion_test_by_species.csv"
 PAIRS_PER_IMAGE = 4
 FUSION_EPOCHS = 40
 SEED = 42
+WINDOW_SYSTEM = "linear_windows"
+WINDOW_VAL_FLOOR = 0.638
 
 
 class WeightedSum(nn.Module):
@@ -322,6 +328,230 @@ def write_species(labels: list[int], predictions: list[int]) -> None:
             )
 
 
+def load_logit_cache(modality: str, split_name: str) -> dict[str, np.ndarray]:
+    cache_path = LOGIT_DIR / f"{modality}_{split_name}.npz"
+    if not cache_path.is_file():
+        raise RuntimeError(f"missing cached logits: {cache_path.name}")
+    stored = np.load(cache_path, allow_pickle=False)
+    return {
+        str(sample_id): np.asarray(logits, dtype=np.float32)
+        for sample_id, logits in zip(stored["ids"], stored["logits"])
+    }
+
+
+def rows_for_cache(modality: str, split_name: str, cache: dict[str, np.ndarray]) -> list[dict[str, str]]:
+    return [row for row in read_split(modality, split_name) if row["sample_id"] in cache]
+
+
+def mean_window_path(split_name: str) -> Path:
+    return LOGIT_DIR / f"audio_mean_windows_{split_name}.npz"
+
+
+def load_mean_window_logits(split_name: str) -> dict[str, tuple[np.ndarray, int]]:
+    cache_path = mean_window_path(split_name)
+    if not cache_path.is_file():
+        return {}
+    stored = np.load(cache_path, allow_pickle=False)
+    return {
+        str(sample_id): (np.asarray(logits, dtype=np.float32), int(count))
+        for sample_id, logits, count in zip(stored["ids"], stored["logits"], stored["n_windows"])
+    }
+
+
+def save_mean_window_logits(
+    split_name: str,
+    logits: dict[str, np.ndarray],
+    counts: dict[str, int],
+    order: list[str],
+) -> None:
+    LOGIT_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        mean_window_path(split_name),
+        ids=np.array(order),
+        logits=np.stack([logits[sample_id] for sample_id in order]).astype(np.float32),
+        n_windows=np.array([counts[sample_id] for sample_id in order], dtype=np.int32),
+    )
+
+
+def read_result_rows() -> list[dict[str, str]]:
+    if not RESULT_PATH.is_file():
+        return []
+    with RESULT_PATH.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def result_exists(rows: list[dict[str, str]], stage: str, system: str) -> bool:
+    return any(row["stage"] == stage and row["system"] == system for row in rows)
+
+
+def result_row(
+    stage: str,
+    accuracy: float,
+    nll: float,
+    count: int,
+    temperature: float,
+    note: str,
+) -> dict[str, str]:
+    return {
+        "stage": stage,
+        "system": WINDOW_SYSTEM,
+        "accuracy": f"{accuracy:.6f}",
+        "nll": f"{nll:.6f}",
+        "n": str(count),
+        "temperature": f"{temperature:.1f}",
+        "note": note,
+    }
+
+
+def mean_windows_for_split(
+    model: nn.Module,
+    split_name: str,
+    fallback: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    rows = rows_for_cache("audio", split_name, fallback)
+    order = [row["sample_id"] for row in rows]
+    cached = load_mean_window_logits(split_name)
+    if cached and set(order) <= set(cached):
+        print(f"loaded window cache {split_name} {len(order)}", flush=True)
+        return {sample_id: cached[sample_id][0] for sample_id in order}
+
+    logits: dict[str, np.ndarray] = {}
+    counts: dict[str, int] = {}
+    for index, row in enumerate(rows, start=1):
+        try:
+            averaged, count = train.audio_window_logits(model, row)
+        except Exception as exc:
+            print(f"window fallback {row['file_path']}: {exc}", flush=True)
+            averaged = np.asarray(fallback[row["sample_id"]], dtype=np.float32)
+            count = 1
+        logits[row["sample_id"]] = averaged
+        counts[row["sample_id"]] = count
+        if index % 25 == 0 or index == len(rows):
+            print(f"windows {split_name} {index}/{len(rows)} windows_used {count}", flush=True)
+    save_mean_window_logits(split_name, logits, counts, order)
+    return logits
+
+
+def check_audio_checkpoint(model: nn.Module, row: dict[str, str], cached: np.ndarray) -> None:
+    fresh, _label = MelImageSet([row], train=False)[0]
+    with torch.no_grad():
+        logits = model(fresh.unsqueeze(0)).numpy()[0]
+    delta = float(np.max(np.abs(logits - cached)))
+    print(f"checkpoint check {row['sample_id']} max_abs={delta:.5f}", flush=True)
+    if delta > 0.05:
+        raise RuntimeError("the saved recording model does not match the cached first-window logits")
+
+
+def evaluate_windows() -> None:
+    """Score whole-file recording windows. Touch the test split only if val improves."""
+    checkpoint_path = ROOT / "models" / "fusion_best.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("audio_pooling") == "mean_windows":
+        print("windows already adopted; test split will not be scored again", flush=True)
+        return
+    if checkpoint.get("system") != "linear":
+        raise RuntimeError("window pooling stays on the saved linear fusion layer")
+    existing = read_result_rows()
+    if result_exists(existing, "test", WINDOW_SYSTEM) or result_exists(existing, "val", WINDOW_SYSTEM):
+        print("window result already recorded; test split will not be scored again", flush=True)
+        return
+
+    audio_checkpoint = torch.load(ROOT / "models" / "audio_best.pt", map_location="cpu", weights_only=False)
+    if audio_checkpoint.get("labels") != LABELS:
+        raise RuntimeError("audio checkpoint labels do not match the species list")
+    audio_net = audio_mobilenet()
+    audio_net.load_state_dict(audio_checkpoint["state_dict"])
+    audio_net.eval()
+
+    image_val = load_logit_cache("image", "val")
+    audio_val = load_logit_cache("audio", "val")
+    image_rows = rows_for_cache("image", "val", image_val)
+    audio_rows = rows_for_cache("audio", "val", audio_val)
+    check_audio_checkpoint(audio_net, audio_rows[0], audio_val[audio_rows[0]["sample_id"]])
+
+    window_val = mean_windows_for_split(audio_net, "val", audio_val)
+    val_pairs = build_pairs("val", image_val, window_val, image_rows, audio_rows, exhaustive=True)
+    module = LogitFuse()
+    module.load_state_dict(checkpoint["state_dict"])
+    module.eval()
+    accuracy, nll, _, _ = score("linear", module, val_pairs, image_val, window_val)
+    print(
+        f"WINDOW_VAL acc={accuracy:.6f} nll={nll:.6f} n={len(val_pairs)} floor={WINDOW_VAL_FLOOR:.6f}",
+        flush=True,
+    )
+    if accuracy <= WINDOW_VAL_FLOOR:
+        existing.append(
+            result_row(
+                "val",
+                accuracy,
+                nll,
+                len(val_pairs),
+                1.0,
+                f"not adopted; did not beat linear {WINDOW_VAL_FLOOR:.3f}",
+            )
+        )
+        write_results(existing)
+        print("WINDOW_KEEP first 3 seconds", flush=True)
+        return
+
+    image_calib = load_logit_cache("image", "calib")
+    audio_calib = load_logit_cache("audio", "calib")
+    window_calib = mean_windows_for_split(audio_net, "calib", audio_calib)
+    calib_pairs = build_pairs(
+        "calib",
+        image_calib,
+        window_calib,
+        rows_for_cache("image", "calib", image_calib),
+        rows_for_cache("audio", "calib", audio_calib),
+        exhaustive=True,
+    )
+    temperature = fit_temperature("linear", module, calib_pairs, image_calib, window_calib)
+    calib_accuracy, calib_nll, _, _ = score(
+        "linear", module, calib_pairs, image_calib, window_calib, temperature
+    )
+
+    image_test = load_logit_cache("image", "test")
+    audio_test = load_logit_cache("audio", "test")
+    window_test = mean_windows_for_split(audio_net, "test", audio_test)
+    test_pairs = build_pairs(
+        "test",
+        image_test,
+        window_test,
+        rows_for_cache("image", "test", image_test),
+        rows_for_cache("audio", "test", audio_test),
+        exhaustive=True,
+    )
+    test_accuracy, test_nll, test_labels, test_predictions = score(
+        "linear", module, test_pairs, image_test, window_test, temperature
+    )
+    print(
+        f"WINDOW_TEST acc={test_accuracy:.6f} nll={test_nll:.6f} "
+        f"temperature={temperature:.1f} n={len(test_pairs)}",
+        flush=True,
+    )
+
+    for row in existing:
+        if row["stage"] == "test" and row["system"] == "linear" and "superseded" not in row["note"]:
+            row["note"] = f"{row['note']}; superseded by {WINDOW_SYSTEM}".strip("; ")
+    window_note = f"adopted; mean of up to {train.MAX_AUDIO_WINDOWS} windows of {train.CLIP_SECONDS:.0f} seconds"
+    existing.append(result_row("val", accuracy, nll, len(val_pairs), 1.0, window_note))
+    existing.append(
+        result_row("calib", calib_accuracy, calib_nll, len(calib_pairs), temperature, "temperature fit on calib")
+    )
+    existing.append(result_row("test", test_accuracy, test_nll, len(test_pairs), temperature, "scored once"))
+    archive = SPECIES_PATH.with_name("fusion_test_by_species_first_window.csv")
+    if SPECIES_PATH.is_file() and not archive.is_file():
+        shutil.copyfile(SPECIES_PATH, archive)
+    write_results(existing)
+    write_species(test_labels, test_predictions)
+    checkpoint["temperature"] = float(temperature)
+    checkpoint["audio_pooling"] = "mean_windows"
+    checkpoint["max_windows"] = train.MAX_AUDIO_WINDOWS
+    checkpoint["window_seconds"] = train.CLIP_SECONDS
+    torch.save(checkpoint, checkpoint_path)
+    print("WINDOW_ADOPTED", flush=True)
+
+
 def main() -> None:
     torch.manual_seed(SEED)
     image_model_net, audio_model_net = load_models()
@@ -443,4 +673,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "windows":
+        evaluate_windows()
+    else:
+        main()

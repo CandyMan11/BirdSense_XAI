@@ -74,6 +74,9 @@
     button:disabled { opacity: 0.6; cursor: wait; }
     .result { margin-top: 8px; }
     .call { font-size: 1.7rem; margin: 0; }
+    .verdict { font-weight: 650; margin: 8px 0 0; }
+    .verdict.correct { color: var(--green); }
+    .verdict.incorrect { color: #8a4b12; }
     .sub { color: var(--muted); margin: 4px 0 14px; }
     .bars { display: grid; gap: 8px; }
     .bar-row { display: grid; grid-template-columns: minmax(140px, 190px) 1fr 52px; gap: 8px; align-items: center; }
@@ -117,17 +120,19 @@
     <p id="status"></p>
     <section class="card result" id="result" hidden>
       <p class="call" id="call"></p>
+      <p class="verdict" id="verdict"></p>
       <p class="sub" id="call-detail"></p>
+      <p class="sub" id="agreement"></p>
       <div class="bars" id="bars"></div>
       <div class="trio">
         <div class="card"><h2>Photo model</h2><p id="image-call"></p></div>
         <div class="card"><h2>Recording model</h2><p id="audio-call"></p></div>
-        <div class="card"><h2>Contribution to the fused call</h2><p id="contrib"></p></div>
+        <div class="card"><h2>Contribution to the prediction</h2><p id="contrib"></p></div>
       </div>
     </section>
   </main>
   <script>
-    const state = { files: [], species: [] };
+    const state = { files: [], species: [], speciesTest: {} };
 
     function optionLabel(file) {
       const name = file.file_path.split("/").pop();
@@ -166,14 +171,79 @@
       return `${Math.round(value * 1000) / 10}%`;
     }
 
+    function withRate(species) {
+      const row = state.speciesTest[species];
+      if (!row) return species;
+      return `${species} (${percent(Number(row.accuracy))} on the recorded test, n=${row.n})`;
+    }
+
+    function verdictFor(result) {
+      const call = result.fused.species;
+      const photo = result.file_species.image;
+      const recording = result.file_species.audio;
+      if (photo === recording) {
+        const correct = call === photo;
+        if (correct) {
+          return { kind: "correct", text: `Correct. Both files are labeled ${withRate(photo)}.` };
+        }
+        return {
+          kind: "incorrect",
+          text: `Incorrect. Both files are labeled ${withRate(photo)}. The prediction was ${withRate(call)}.`,
+        };
+      }
+      let lead = `The photo is labeled ${withRate(photo)} and the recording is labeled ${withRate(recording)}. The prediction matches neither label.`;
+      let kind = "incorrect";
+      if (call === photo) {
+        lead = `The prediction matches the photo label, ${withRate(photo)}, and not the recording label, ${recording}.`;
+        kind = "mixed";
+      } else if (call === recording) {
+        lead = `The prediction matches the recording label, ${withRate(recording)}, and not the photo label, ${photo}.`;
+        kind = "mixed";
+      }
+      return { kind, text: lead };
+    }
+
+    function recordingScoreNote(result) {
+      const count = Number(result.n_windows);
+      if (result.audio_pooling === "mean_windows" && count > 1) {
+        return `The recording score is the mean of ${count} windows of 3 seconds.`;
+      }
+      if (result.audio_pooling === "mean_windows") {
+        return "The recording score uses one 3-second window.";
+      }
+      return "The recording score uses the first 3 seconds.";
+    }
+
+    function contributionText(result) {
+      const part = result.contribution;
+      const image = part.image;
+      const audio = part.audio;
+      const bias = `Bias ${part.bias.toFixed(2)}.`;
+      if (image > 0 && audio < 0) {
+        return `The photo supplied the sensor score for ${result.fused.species}. The recording pulled against this prediction (${audio.toFixed(2)}). ${bias}`;
+      }
+      if (audio > 0 && image < 0) {
+        return `The recording supplied the sensor score for ${result.fused.species}. The photo pulled against this prediction (${image.toFixed(2)}). ${bias}`;
+      }
+      const sum = image + audio;
+      if (Math.abs(sum) < 1e-6) {
+        return `Photo score ${image.toFixed(2)}, recording score ${audio.toFixed(2)}. ${bias}`;
+      }
+      return `Photo supplied ${percent(image / sum)} of the sensor score and the recording supplied ${percent(audio / sum)}. ${bias}`;
+    }
+
     function render(result) {
       document.getElementById("result").hidden = false;
       document.getElementById("call").textContent = result.fused.species;
-      const fileNote = result.same_species_files
-        ? `Both files are labeled ${result.file_species.image}.`
-        : `The photo is labeled ${result.file_species.image} and the recording is labeled ${result.file_species.audio}.`;
+      const verdict = verdictFor(result);
+      const verdictNode = document.getElementById("verdict");
+      verdictNode.textContent = verdict.text;
+      verdictNode.className = `verdict ${verdict.kind}`;
       document.getElementById("call-detail").textContent =
-        `${result.fused.scientific} · fused probability ${percent(result.fused.probability)} after temperature ${result.temperature}. ${fileNote}`;
+        `${result.fused.scientific} · fused probability ${percent(result.fused.probability)} after temperature ${result.temperature}. ${recordingScoreNote(result)}`;
+      document.getElementById("agreement").textContent = result.image_only.species === result.audio_only.species
+        ? `Photo and recording agree on ${result.image_only.species}.`
+        : `Photo says ${result.image_only.species}. Recording says ${result.audio_only.species}.`;
       document.getElementById("bars").innerHTML = result.ranking.map((row) => `
         <div class="bar-row">
           <span>${row.species}</span>
@@ -185,9 +255,7 @@
         `${result.image_only.species} · ${percent(result.image_only.probability)}`;
       document.getElementById("audio-call").textContent =
         `${result.audio_only.species} · ${percent(result.audio_only.probability)}`;
-      const part = result.contribution;
-      document.getElementById("contrib").textContent =
-        `Photo scores ${part.image.toFixed(2)}, recording scores ${part.audio.toFixed(2)}, bias ${part.bias.toFixed(2)}. These add up to the fused score for ${result.fused.species} before calibration.`;
+      document.getElementById("contrib").textContent = contributionText(result);
     }
 
     async function predict() {
@@ -237,6 +305,7 @@
       ]);
       state.files = catalog.files;
       state.species = catalog.species;
+      state.speciesTest = summary.species_test || {};
       document.getElementById("metrics").innerHTML = `
         <div class="metric"><b>${percent(Number(summary.test_accuracy))}</b><span>Recorded test accuracy</span></div>
         <div class="metric"><b>${percent(Number(summary.val_fusion))}</b><span>Validation, fused</span></div>
