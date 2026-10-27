@@ -1,0 +1,21 @@
+stage,system,accuracy,nll,n,temperature,note
+val,image_only,0.570000,1.546407,4500,1.0,
+val,mean_prob,0.587556,1.596930,4500,1.0,
+val,weighted,0.592889,1.345883,4500,1.0,
+val,linear,0.638000,1.175925,4500,1.0,selected
+calib,linear,0.642000,1.130660,2000,1.2,temperature fit on calib
+test,linear,0.676700,1.075853,4485,1.2,scored once; superseded by linear_windows
+val,linear_windows,0.658222,1.100610,4500,1.0,adopted; mean of up to 8 windows of 3 seconds
+calib,linear_windows,0.659500,1.079886,2000,1.1,temperature fit on calib
+test,linear_windows,0.679822,1.056665,4485,1.1,scored once
+val,image_only_aug,0.583333,1.535914,4500,1.0,audio=mean_windows
+val,audio_only_aug,0.403333,2.062661,4500,1.0,audio=mean_windows
+val,mean_prob_aug,0.656889,1.303593,4500,1.0,audio=mean_windows
+val,weighted_aug,0.645778,1.172200,4500,1.0,audio=mean_windows
+val,linear_aug,0.712889,0.935224,4500,1.0,adopted; selected; audio=mean_windows
+val,linear_first_window_aug,0.707111,0.947689,4500,1.0,comparison only; not used
+calib,linear_aug,0.710500,0.946503,2000,0.9,adopted; temperature fit on calib; audio=mean_windows
+test,image_only_aug,0.575920,1.499736,4485,1.0,scored once; audio=mean_windows
+test,audio_only_aug,0.354515,2.135163,4485,1.0,scored once; audio=mean_windows
+test,mean_prob_aug,0.651505,1.331241,4485,1.0,scored once; audio=mean_windows
+test,linear_aug,0.741137,0.861081,4485,0.9,adopted; scored once; audio=mean_windows

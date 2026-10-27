@@ -29,6 +29,8 @@ LOG_PATH = ROOT / "data" / "metadata" / "training_log.csv"
 SKIP_PATH = ROOT / "data" / "metadata" / "audio_decode_skips.csv"
 MODEL_DIR = ROOT / "models"
 MEL_CACHE = ROOT / "data" / "cache" / "mel"
+WINDOW_MEL_CACHE = ROOT / "data" / "cache" / "mel_windows"
+LONG_MEL_CACHE = ROOT / "data" / "cache" / "mel_long"
 
 SAMPLE_RATE = 22050
 CLIP_SECONDS = 3.0
@@ -69,7 +71,7 @@ class ImageSet(Dataset):
         if train:
             self.transform = transforms.Compose(
                 [
-                    transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+                    transforms.RandomResizedCrop(224, scale=(0.4, 1.0)),
                     transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -317,8 +319,8 @@ class MelNet(nn.Module):
         return self.classifier(hidden)
 
 
-def image_model() -> nn.Module:
-    weights = models.MobileNet_V3_Small_Weights.DEFAULT
+def image_model(pretrained: bool = True) -> nn.Module:
+    weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
     model = models.mobilenet_v3_small(weights=weights)
     for parameter in model.features.parameters():
         parameter.requires_grad = False
@@ -339,9 +341,9 @@ def image_model_finetune(checkpoint_path: Path) -> tuple[nn.Module, float]:
     return model, float(checkpoint.get("val_acc", 0.0))
 
 
-def audio_mobilenet() -> nn.Module:
+def audio_mobilenet(pretrained: bool = True) -> nn.Module:
     """ImageNet MobileNet on a log-mel image. The small MelNet was too weak."""
-    weights = models.MobileNet_V3_Small_Weights.DEFAULT
+    weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
     model = models.mobilenet_v3_small(weights=weights)
     for parameter in model.features.parameters():
         parameter.requires_grad = False
@@ -370,28 +372,66 @@ class MelImageSet(Dataset):
         return tensor, LABEL_TO_INDEX[row["common_name"]]
 
 
-def audio_window_logits(model: nn.Module, row: dict[str, str]) -> tuple[np.ndarray, int]:
-    """Average the saved recording model over 3-second windows.
-
-    The first window is the same clip the model was trained on. Later windows
-    are spread across the rest of the file, up to MAX_AUDIO_WINDOWS in total
-    and MAX_AUDIO_SECONDS of audio.
-    """
-    first, _label = MelImageSet([row], train=False)[0]
+def mel_windows_from_array(audio: np.ndarray) -> list[np.ndarray]:
+    """Log-mel slices covering a recording, up to MAX_AUDIO_WINDOWS."""
     window = int(SAMPLE_RATE * CLIP_SECONDS)
-    tensors = [first]
-    try:
-        audio = decode_capped(ROOT / row["file_path"], int(SAMPLE_RATE * MAX_AUDIO_SECONDS))
-        for start in extra_window_starts(int(audio.shape[0]), window, MAX_AUDIO_WINDOWS):
-            chunk = fit_length(audio[start : start + window], window)
-            tensors.append(mel_image_tensor(log_mel(chunk)))
-    except Exception as exc:
-        print(f"extra windows skipped {row['file_path']}: {exc}", flush=True)
-        tensors = [first]
-    batch = torch.stack(tensors)
+    if int(audio.shape[0]) <= 0:
+        raise RuntimeError("recording is empty")
+    starts = [0, *extra_window_starts(int(audio.shape[0]), window, MAX_AUDIO_WINDOWS)]
+    mels = []
+    for start in starts:
+        chunk = fit_length(audio[start : start + window], window)
+        mels.append(log_mel(chunk))
+    return mels
+
+
+def mel_windows_from_path(path: Path) -> list[np.ndarray]:
+    audio = decode_capped(path, int(SAMPLE_RATE * MAX_AUDIO_SECONDS))
+    return mel_windows_from_array(audio)
+
+
+def mel_windows_for_row(row: dict[str, str]) -> list[np.ndarray]:
+    WINDOW_MEL_CACHE.mkdir(parents=True, exist_ok=True)
+    cache = WINDOW_MEL_CACHE / f"{row['sample_id']}.npz"
+    if cache.is_file():
+        stored = np.load(cache)
+        count = int(stored["count"])
+        return [np.asarray(stored[f"w{index}"], dtype=np.float32) for index in range(count)]
+    mels = mel_windows_from_path(ROOT / row["file_path"])
+    payload = {f"w{index}": mel for index, mel in enumerate(mels)}
+    payload["count"] = np.int32(len(mels))
+    np.savez(cache, **payload)
+    return mels
+
+
+def image_tensor_from_path(path: Path) -> torch.Tensor:
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    with Image.open(path) as image:
+        return transform(image.convert("RGB"))
+
+
+def audio_path_logits(model: nn.Module, path: Path) -> tuple[np.ndarray, int]:
+    mels = mel_windows_from_path(path)
+    batch = torch.stack([mel_image_tensor(mel) for mel in mels])
     with torch.no_grad():
         averaged = model(batch).mean(dim=0)
-    return averaged.numpy().astype(np.float32), len(tensors)
+    return averaged.numpy().astype(np.float32), len(mels)
+
+
+def audio_window_logits(model: nn.Module, row: dict[str, str]) -> tuple[np.ndarray, int]:
+    """Average the recording model over 3-second windows spread across the file."""
+    mels = mel_windows_for_row(row)
+    batch = torch.stack([mel_image_tensor(mel) for mel in mels])
+    with torch.no_grad():
+        averaged = model(batch).mean(dim=0)
+    return averaged.numpy().astype(np.float32), len(mels)
 
 
 def run_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer | None) -> tuple[float, float]:
@@ -436,7 +476,7 @@ def fit_model(
     backbone_lr: float,
     patience: int = PATIENCE,
 ) -> None:
-    if modality == "image_ft":
+    if modality in ("image_ft", "image_aug"):
         train_data = ImageSet(train_rows, train=True)
         val_data = ImageSet(val_rows, train=False)
     else:
@@ -630,12 +670,263 @@ def train_modality(modality: str) -> None:
     print(f"{modality} best val_acc={best_accuracy:.3f} saved {destination}", flush=True)
 
 
+def skipped_audio_ids() -> set[str]:
+    if not SKIP_PATH.is_file():
+        return set()
+    with SKIP_PATH.open(encoding="utf-8", newline="") as handle:
+        return {row["sample_id"] for row in csv.DictReader(handle)}
+
+
+def audio_rows(split_name: str) -> list[dict[str, str]]:
+    skipped = skipped_audio_ids()
+    return [row for row in read_split("audio", split_name) if row["sample_id"] not in skipped]
+
+
+@torch.no_grad()
+def file_window_accuracy(model: nn.Module, rows: list[dict[str, str]]) -> float:
+    """Accuracy when each recording votes with the mean of its windows."""
+    if not rows:
+        return 0.0
+    model.eval()
+    correct = 0
+    used = 0
+    for row in rows:
+        try:
+            logits, _count = audio_window_logits(model, row)
+        except Exception as exc:
+            print(f"skip val window {row['file_path']}: {exc}", flush=True)
+            continue
+        predicted = int(np.argmax(logits))
+        correct += int(predicted == LABEL_TO_INDEX[row["common_name"]])
+        used += 1
+    if not used:
+        return 0.0
+    return correct / used
+
+
+def long_db_for_row(row: dict[str, str]) -> np.ndarray:
+    """Log-power mel (dB, float16) for up to the first MAX_AUDIO_SECONDS of a file.
+
+    A file shorter than one window is zero-padded the same way decode_clip pads it.
+    """
+    LONG_MEL_CACHE.mkdir(parents=True, exist_ok=True)
+    cache = LONG_MEL_CACHE / f"{row['sample_id']}.npy"
+    if cache.is_file():
+        return np.load(cache)
+    audio = decode_capped(ROOT / row["file_path"], int(SAMPLE_RATE * MAX_AUDIO_SECONDS))
+    need = int(SAMPLE_RATE * CLIP_SECONDS)
+    if audio.shape[0] < need:
+        audio = fit_length(audio, need)
+    power = librosa.feature.melspectrogram(
+        y=audio, sr=SAMPLE_RATE, n_fft=1024, hop_length=512, n_mels=N_MELS, center=True
+    )
+    decibels = librosa.power_to_db(power, ref=1.0, top_db=None).astype(np.float16)
+    np.save(cache, decibels)
+    return decibels
+
+
+def slice_mel(decibels: np.ndarray, start: int) -> np.ndarray:
+    """One MEL_FRAMES slice, scaled to its own peak the way log_mel scales a 3-second clip."""
+    piece = decibels[:, start : start + MEL_FRAMES].astype(np.float32)
+    peak = float(piece.max())
+    if peak > -99.0:
+        piece = np.maximum(piece - peak, -80.0)
+    return piece
+
+
+def mask_bands(mel: np.ndarray) -> np.ndarray:
+    """Training only: blank one short time band and one short frequency band."""
+    out = mel.copy()
+    fill = float(out.mean())
+    time_width = int(torch.randint(0, 25, (1,)).item())
+    if time_width:
+        begin = int(torch.randint(0, MEL_FRAMES - time_width + 1, (1,)).item())
+        out[:, begin : begin + time_width] = fill
+    freq_width = int(torch.randint(0, 11, (1,)).item())
+    if freq_width:
+        begin = int(torch.randint(0, N_MELS - freq_width + 1, (1,)).item())
+        out[begin : begin + freq_width, :] = fill
+    return out
+
+
+class RandomSliceMelSet(Dataset):
+    """Each item is one random 3-second slice from the first MAX_AUDIO_SECONDS of a file."""
+
+    def __init__(self, rows: list[dict[str, str]]) -> None:
+        self.rows = rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        row = self.rows[index]
+        decibels = long_db_for_row(row)
+        span = int(decibels.shape[1]) - MEL_FRAMES
+        start = int(torch.randint(0, span + 1, (1,)).item()) if span > 0 else 0
+        tensor = mel_image_tensor(mask_bands(slice_mel(decibels, start)))
+        if torch.rand(1).item() < 0.5:
+            tensor = torch.flip(tensor, dims=[2])
+        return tensor, LABEL_TO_INDEX[row["common_name"]]
+
+
+def backup_once(source: Path, target: Path) -> None:
+    if source.is_file() and not target.is_file():
+        target.write_bytes(source.read_bytes())
+
+
+def train_image_aug() -> None:
+    """Continue the saved photo model with a wider training crop.
+
+    Only the train split updates weights. Val decides. The candidate is written
+    to models/image_aug.pt, and only when it beats the saved photo model.
+    """
+    source = MODEL_DIR / "image_best.pt"
+    backup_once(source, MODEL_DIR / "image_before_aug.pt")
+    candidate = MODEL_DIR / "image_aug.pt"
+    candidate.unlink(missing_ok=True)
+    train_rows = read_split("image", "train")
+    val_rows = read_split("image", "val")
+    model, _stored = image_model_finetune(source)
+    model.eval()
+    _loss, baseline = run_epoch(model, DataLoader(ImageSet(val_rows, train=False), batch_size=BATCH_SIZE), None)
+    print(f"image_aug baseline val_acc={baseline:.3f} (saved model, same val images)", flush=True)
+    fit_model(
+        "image_aug",
+        model,
+        train_rows,
+        val_rows,
+        epochs=8,
+        destination=candidate,
+        floor_accuracy=baseline,
+        backbone_lr=1e-4,
+        patience=3,
+    )
+    if candidate.is_file():
+        print("IMAGE_AUG_KEPT", flush=True)
+    else:
+        print("IMAGE_AUG_NOT_KEPT saved photo model stays", flush=True)
+
+
+def train_audio_aug(resume: bool = False) -> None:
+    """Continue the saved recording model on random 3-second slices.
+
+    Only the train split updates weights. The score that decides is file-level:
+    the mean of up to MAX_AUDIO_WINDOWS windows on each val recording, the same
+    score the saved model gets. The candidate goes to models/audio_aug.pt, and
+    only when it beats the saved model.
+    """
+    torch.manual_seed(SEED)
+    source = MODEL_DIR / "audio_best.pt"
+    backup_once(source, MODEL_DIR / "audio_before_aug.pt")
+    candidate = MODEL_DIR / "audio_aug.pt"
+    resume = resume and candidate.is_file()
+    if not resume:
+        candidate.unlink(missing_ok=True)
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    if checkpoint.get("labels") != LABELS:
+        raise RuntimeError("audio checkpoint labels do not match the species list")
+    saved_model = audio_mobilenet(pretrained=False)
+    saved_model.load_state_dict(checkpoint["state_dict"])
+    saved_model.eval()
+    model = audio_mobilenet(pretrained=False)
+    resumed_best = None
+    if resume:
+        # Continue from the candidate; it is still compared with the saved model.
+        resumed = torch.load(candidate, map_location="cpu", weights_only=False)
+        model.load_state_dict(resumed["state_dict"])
+        resumed_best = float(resumed["val_acc"])
+        print(f"audio_aug resuming from candidate (epoch {resumed['epoch']}, file val {resumed_best:.4f})", flush=True)
+    else:
+        model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+
+    train_rows = audio_rows("train")
+    val_rows = audio_rows("val")
+    usable: list[dict[str, str]] = []
+    for index, row in enumerate(train_rows, start=1):
+        try:
+            long_db_for_row(row)
+            usable.append(row)
+        except Exception as exc:
+            print(f"skip long mel {row['file_path']}: {exc}", flush=True)
+        if index % 50 == 0 or index == len(train_rows):
+            print(f"long mel cache {index}/{len(train_rows)} usable {len(usable)}", flush=True)
+    print(f"audio_aug train files {len(usable)} val files {len(val_rows)}", flush=True)
+
+    baseline = file_window_accuracy(saved_model, val_rows)
+    print(f"audio_aug baseline file-level val_acc={baseline:.4f} (saved model)", flush=True)
+
+    loader = DataLoader(RandomSliceMelSet(usable), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    backbone = [parameter for parameter in model.features.parameters() if parameter.requires_grad]
+    head = [parameter for parameter in model.classifier.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW([{"params": backbone, "lr": 1e-4}, {"params": head, "lr": 1e-3}])
+    best = max(baseline, resumed_best) if resumed_best is not None else baseline
+    stale = 0
+    epochs = 8 if resume else 10
+    patience = 3
+    for epoch in range(1, epochs + 1):
+        started = time.perf_counter()
+        train_loss, train_accuracy = run_epoch(model, loader, optimizer)
+        val_accuracy = file_window_accuracy(model, val_rows)
+        kept = "no"
+        if val_accuracy > best:
+            best = val_accuracy
+            stale = 0
+            kept = "yes"
+            torch.save(
+                {
+                    "modality": "audio_aug",
+                    "labels": LABELS,
+                    "state_dict": model.state_dict(),
+                    "val_acc": val_accuracy,
+                    "epoch": epoch,
+                },
+                candidate,
+            )
+        else:
+            stale += 1
+        elapsed = time.perf_counter() - started
+        print(
+            f"audio_aug epoch {epoch}/{epochs} train_loss={train_loss:.4f} train_acc={train_accuracy:.3f} "
+            f"file_val_acc={val_accuracy:.4f} best={best:.4f}",
+            flush=True,
+        )
+        append_log(
+            {
+                "modality": "audio_aug",
+                "epoch": str(epoch),
+                "train_loss": f"{train_loss:.6f}",
+                "train_acc": f"{train_accuracy:.6f}",
+                "val_acc": f"{val_accuracy:.6f}",
+                "seconds": f"{elapsed:.1f}",
+                "kept_checkpoint": kept,
+            }
+        )
+        if stale >= patience:
+            print(f"audio_aug stopped after {patience} epochs without a better file-level val accuracy", flush=True)
+            break
+    if candidate.is_file():
+        print(f"AUDIO_AUG_KEPT file-level val {baseline:.4f} -> {best:.4f}", flush=True)
+    else:
+        print(f"AUDIO_AUG_NOT_KEPT saved recording model stays at {baseline:.4f}", flush=True)
+
+
 def main() -> None:
     torch.manual_seed(SEED)
     requested = sys.argv[1:] or ["image", "audio"]
     if requested == ["improve"]:
         print("fine-tuning photos and recordings on the train split; calib and test stay unread", flush=True)
         improve()
+        print("TRAINING_DONE", flush=True)
+        return
+    if requested == ["aug-image"]:
+        print("photo model, wider training crop; train updates weights, val decides", flush=True)
+        train_image_aug()
+        print("TRAINING_DONE", flush=True)
+        return
+    if requested in (["aug-audio"], ["aug-audio-resume"]):
+        print("recording model, random 3-second slices and masking; train updates weights, val decides", flush=True)
+        train_audio_aug(resume=requested == ["aug-audio-resume"])
         print("TRAINING_DONE", flush=True)
         return
     if requested == ["image", "audio"] and LOG_PATH.exists():

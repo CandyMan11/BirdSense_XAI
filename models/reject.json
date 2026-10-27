@@ -1,0 +1,12 @@
+{
+  "metric": "highest fused probability and highest photo-only probability",
+  "threshold": 0.3035,
+  "photo_threshold": 0.2904,
+  "kept_of_known_species_each_cut": 0.95,
+  "fit_on": "calib, 2000 pairs from the 20 species",
+  "val_accepted_both_cuts": 0.8967,
+  "val_accuracy_all": 0.7129,
+  "val_accuracy_accepted": 0.7546,
+  "val_accuracy_rejected": 0.3505,
+  "note": "No bird outside the 20 species exists in the data, so the rate of catching one is not measured."
+}

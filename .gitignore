@@ -7,4 +7,14 @@ venv/
 .ipynb_checkpoints/
 
 # Local dataset. Rebuild with python download_dataset.py.
-data/
+data/*
+# The deployed page reads these two small result tables.
+!data/metadata/
+data/metadata/*
+!data/metadata/fusion_results.csv
+!data/metadata/fusion_test_by_species.csv
+
+# Training backups and candidates are not needed to run the page.
+models/*_aug.pt
+models/*_before_aug.pt
+models/*_deploy.pt

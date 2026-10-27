@@ -1,3 +1,10 @@
-# Dataset download uses the Python 3.10+ standard library only.
-# Training also uses the packages already installed in this environment:
-# torch, torchvision, numpy, Pillow, librosa, soundfile, av
+# CPU wheels avoid the large CUDA download on a cloud host.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+numpy==2.2.6
+Pillow==12.3.0
+librosa==0.11.0
+soundfile==0.14.0
+av==17.1.0
+streamlit==1.65.0

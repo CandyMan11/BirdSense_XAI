@@ -11,6 +11,7 @@ whole-file recording windows beat the saved validation accuracy.
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -122,8 +123,14 @@ def usable_audio(split_name: str) -> list[dict[str, str]]:
 
 
 @torch.no_grad()
-def embed_split(model: nn.Module, rows: list[dict[str, str]], modality: str, split_name: str) -> dict[str, np.ndarray]:
-    cache_path = LOGIT_DIR / f"{modality}_{split_name}.npz"
+def embed_split(
+    model: nn.Module,
+    rows: list[dict[str, str]],
+    modality: str,
+    split_name: str,
+    directory: Path = LOGIT_DIR,
+) -> dict[str, np.ndarray]:
+    cache_path = directory / f"{modality}_{split_name}.npz"
     if cache_path.is_file():
         stored = np.load(cache_path, allow_pickle=False)
         print(f"loaded {cache_path.name} {len(stored['ids'])}", flush=True)
@@ -142,7 +149,7 @@ def embed_split(model: nn.Module, rows: list[dict[str, str]], modality: str, spl
         print(f"logits {modality} {split_name} {seen}/{len(rows)}", flush=True)
     logits = np.concatenate(chunks).astype(np.float32)
     ids = np.array([row["sample_id"] for row in rows])
-    LOGIT_DIR.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     np.savez(cache_path, ids=ids, logits=logits)
     return {sample_id: row_logits for sample_id, row_logits in zip(ids.tolist(), logits)}
 
@@ -197,6 +204,8 @@ def batch_logits(
         return torch.log(mixed.clamp_min(1e-8))
     if system == "image_only":
         fused = image_batch
+    elif system == "audio_only":
+        fused = audio_batch
     else:
         if module is None:
             raise RuntimeError(f"missing module for {system}")
@@ -305,8 +314,8 @@ def write_results(rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def write_species(labels: list[int], predictions: list[int]) -> None:
-    with SPECIES_PATH.open("w", encoding="utf-8", newline="") as handle:
+def write_species(labels: list[int], predictions: list[int], destination: Path = SPECIES_PATH) -> None:
+    with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["common_name", "n", "n_correct", "accuracy"],
@@ -343,12 +352,12 @@ def rows_for_cache(modality: str, split_name: str, cache: dict[str, np.ndarray])
     return [row for row in read_split(modality, split_name) if row["sample_id"] in cache]
 
 
-def mean_window_path(split_name: str) -> Path:
-    return LOGIT_DIR / f"audio_mean_windows_{split_name}.npz"
+def mean_window_path(split_name: str, directory: Path = LOGIT_DIR) -> Path:
+    return directory / f"audio_mean_windows_{split_name}.npz"
 
 
-def load_mean_window_logits(split_name: str) -> dict[str, tuple[np.ndarray, int]]:
-    cache_path = mean_window_path(split_name)
+def load_mean_window_logits(split_name: str, directory: Path = LOGIT_DIR) -> dict[str, tuple[np.ndarray, int]]:
+    cache_path = mean_window_path(split_name, directory)
     if not cache_path.is_file():
         return {}
     stored = np.load(cache_path, allow_pickle=False)
@@ -363,10 +372,11 @@ def save_mean_window_logits(
     logits: dict[str, np.ndarray],
     counts: dict[str, int],
     order: list[str],
+    directory: Path = LOGIT_DIR,
 ) -> None:
-    LOGIT_DIR.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     np.savez(
-        mean_window_path(split_name),
+        mean_window_path(split_name, directory),
         ids=np.array(order),
         logits=np.stack([logits[sample_id] for sample_id in order]).astype(np.float32),
         n_windows=np.array([counts[sample_id] for sample_id in order], dtype=np.int32),
@@ -407,10 +417,11 @@ def mean_windows_for_split(
     model: nn.Module,
     split_name: str,
     fallback: dict[str, np.ndarray],
+    directory: Path = LOGIT_DIR,
 ) -> dict[str, np.ndarray]:
     rows = rows_for_cache("audio", split_name, fallback)
     order = [row["sample_id"] for row in rows]
-    cached = load_mean_window_logits(split_name)
+    cached = load_mean_window_logits(split_name, directory)
     if cached and set(order) <= set(cached):
         print(f"loaded window cache {split_name} {len(order)}", flush=True)
         return {sample_id: cached[sample_id][0] for sample_id in order}
@@ -428,7 +439,7 @@ def mean_windows_for_split(
         counts[row["sample_id"]] = count
         if index % 25 == 0 or index == len(rows):
             print(f"windows {split_name} {index}/{len(rows)} windows_used {count}", flush=True)
-    save_mean_window_logits(split_name, logits, counts, order)
+    save_mean_window_logits(split_name, logits, counts, order, directory)
     return logits
 
 
@@ -672,8 +683,370 @@ def main() -> None:
     print("FUSION_DONE", flush=True)
 
 
+def adopted_val_floor(rows: list[dict[str, str]]) -> float:
+    for row in reversed(rows):
+        if row["stage"] == "val" and str(row.get("note", "")).startswith("adopted"):
+            return float(row["accuracy"])
+    for row in rows:
+        if row["stage"] == "val" and row["system"] == "linear":
+            return float(row["accuracy"])
+    return WINDOW_VAL_FLOOR
+
+
+AUG_DIR = ROOT / "data" / "cache" / "logits_aug"
+BACKUP_LOGIT_DIR = LOGIT_DIR / "backup_before_aug"
+AUG_SPECIES_PATH = SPECIES_PATH.with_name("fusion_test_by_species_aug.csv")
+SPLIT_NAMES = ("train", "val", "calib", "test")
+POOLINGS = ("first_window", "mean_windows")
+
+
+def load_candidate(kind: str, changed: bool) -> nn.Module:
+    """The retrained model when it was kept, otherwise the saved one."""
+    stem = "image" if kind == "image" else "audio"
+    path = ROOT / "models" / (f"{stem}_aug.pt" if changed else f"{stem}_best.pt")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("labels") != LABELS:
+        raise RuntimeError(f"{path.name} labels do not match the species list")
+    net = image_model(pretrained=False) if kind == "image" else audio_mobilenet(pretrained=False)
+    net.load_state_dict(checkpoint["state_dict"])
+    net.eval()
+    print(f"using {path.name}", flush=True)
+    return net
+
+
+def seed_unchanged(image_changed: bool, audio_changed: bool) -> None:
+    """A model that was not retrained keeps the logits already cached for it."""
+    AUG_DIR.mkdir(parents=True, exist_ok=True)
+    names = []
+    for split_name in SPLIT_NAMES:
+        if not image_changed:
+            names.append(f"image_{split_name}.npz")
+        if not audio_changed:
+            names.append(f"audio_{split_name}.npz")
+            names.append(f"audio_mean_windows_{split_name}.npz")
+    for name in names:
+        source = LOGIT_DIR / name
+        target = AUG_DIR / name
+        if source.is_file() and not target.is_file():
+            shutil.copyfile(source, target)
+
+
+def selection_run(
+    pooling: str,
+    image_logits: dict[str, dict[str, np.ndarray]],
+    audio_logits: dict[str, dict[str, np.ndarray]],
+    image_rows: dict[str, list[dict[str, str]]],
+    audio_rows_: dict[str, list[dict[str, str]]],
+) -> dict:
+    """Fit on train, choose on val. Calib and test are not touched here."""
+    print(f"selection with audio={pooling}", flush=True)
+    pairs = {
+        split_name: build_pairs(
+            split_name,
+            image_logits[split_name],
+            audio_logits[split_name],
+            image_rows[split_name],
+            audio_rows_[split_name],
+            exhaustive=split_name != "train",
+        )
+        for split_name in ("train", "val")
+    }
+    weighted = train_module("weighted", WeightedSum(), pairs["train"], pairs["val"], image_logits, audio_logits)
+    linear = train_module("linear", LogitFuse(), pairs["train"], pairs["val"], image_logits, audio_logits)
+    modules: dict[str, nn.Module | None] = {
+        "image_only": None,
+        "audio_only": None,
+        "mean_prob": None,
+        "weighted": weighted,
+        "linear": linear,
+    }
+    val_scores: dict[str, tuple[float, float]] = {}
+    for name, module in modules.items():
+        accuracy, nll, _, _ = score(name, module, pairs["val"], image_logits["val"], audio_logits["val"])
+        val_scores[name] = (accuracy, nll)
+        print(f"val {pooling} {name} acc={accuracy:.4f} nll={nll:.4f}", flush=True)
+    chosen = max(
+        ("image_only", "mean_prob", "weighted", "linear"),
+        key=lambda name: (val_scores[name][0], -val_scores[name][1]),
+    )
+    print(f"selected {chosen} with audio={pooling} val acc={val_scores[chosen][0]:.4f}", flush=True)
+    return {
+        "pooling": pooling,
+        "modules": modules,
+        "val_scores": val_scores,
+        "val_pairs": len(pairs["val"]),
+        "chosen": chosen,
+    }
+
+
+def aug_row(stage: str, system: str, accuracy: float, nll: float, count: int, temperature: float, note: str) -> dict[str, str]:
+    return {
+        "stage": stage,
+        "system": f"{system}_aug",
+        "accuracy": f"{accuracy:.6f}",
+        "nll": f"{nll:.6f}",
+        "n": str(count),
+        "temperature": f"{temperature:.1f}",
+        "note": note,
+    }
+
+
+def rebuild(image_changed: bool, audio_changed: bool) -> None:
+    """Refit fusion for retrained checkpoints, then score test once if val clears the floor."""
+    if not (image_changed or audio_changed):
+        raise RuntimeError("nothing was retrained; keep the saved fusion layer")
+    torch.manual_seed(SEED)
+    existing = read_result_rows()
+    if any(row["system"].endswith("_aug") for row in existing):
+        print("an _aug result is already recorded; test split will not be scored again", flush=True)
+        return
+    floor = adopted_val_floor(existing)
+    print(f"fused val floor {floor:.6f}", flush=True)
+
+    image_net = load_candidate("image", image_changed)
+    audio_net = load_candidate("audio", audio_changed)
+    seed_unchanged(image_changed, audio_changed)
+
+    image_rows = {split_name: read_split("image", split_name) for split_name in ("train", "val")}
+    audio_rows_ = {split_name: usable_audio(split_name) for split_name in ("train", "val")}
+    image_logits = {
+        split_name: embed_split(image_net, image_rows[split_name], "image", split_name, AUG_DIR)
+        for split_name in image_rows
+    }
+    first_logits = {
+        split_name: embed_split(audio_net, audio_rows_[split_name], "audio", split_name, AUG_DIR)
+        for split_name in audio_rows_
+    }
+    window_logits = {
+        split_name: mean_windows_for_split(audio_net, split_name, first_logits[split_name], AUG_DIR)
+        for split_name in audio_rows_
+    }
+    by_pooling = {"first_window": first_logits, "mean_windows": window_logits}
+    runs = {
+        pooling: selection_run(pooling, image_logits, by_pooling[pooling], image_rows, audio_rows_)
+        for pooling in POOLINGS
+    }
+    first_best = runs["first_window"]["val_scores"][runs["first_window"]["chosen"]][0]
+    window_best = runs["mean_windows"]["val_scores"][runs["mean_windows"]["chosen"]][0]
+    pooling = "mean_windows" if window_best > first_best else "first_window"
+    other = "first_window" if pooling == "mean_windows" else "mean_windows"
+    run = runs[pooling]
+    chosen = run["chosen"]
+    accuracy, nll = run["val_scores"][chosen]
+    print(
+        f"WINDOWS_VS_SINGLE val single={first_best:.4f} windows={window_best:.4f} keep={pooling}",
+        flush=True,
+    )
+
+    def val_rows_for(run_: dict, adopted: bool, why: str) -> list[dict[str, str]]:
+        rows = []
+        for name, (acc, nll_) in run_["val_scores"].items():
+            note = f"audio={run_['pooling']}"
+            if name == run_["chosen"]:
+                note = f"{'adopted; selected' if adopted else 'not adopted; selected'}; audio={run_['pooling']}"
+                if why:
+                    note += f"; {why}"
+            rows.append(aug_row("val", name, acc, nll_, run_["val_pairs"], 1.0, note))
+        return rows
+
+    other_run = runs[other]
+    other_acc, other_nll = other_run["val_scores"][other_run["chosen"]]
+    comparison = aug_row(
+        "val",
+        f"{other_run['chosen']}_{other}",
+        other_acc,
+        other_nll,
+        other_run["val_pairs"],
+        1.0,
+        "comparison only; not used",
+    )
+
+    if chosen != "linear" or accuracy <= floor:
+        why = (
+            f"did not beat {floor:.3f}"
+            if accuracy <= floor
+            else "the dashboard serves linear fusion only"
+        )
+        write_results(existing + val_rows_for(run, False, why) + [comparison])
+        print(f"FUSION_KEEP_OLD val {accuracy:.6f} floor {floor:.6f} ({why}); test split not scored", flush=True)
+        return
+
+    image_rows["calib"] = read_split("image", "calib")
+    image_rows["test"] = read_split("image", "test")
+    audio_rows_["calib"] = usable_audio("calib")
+    audio_rows_["test"] = usable_audio("test")
+    for split_name in ("calib", "test"):
+        image_logits[split_name] = embed_split(image_net, image_rows[split_name], "image", split_name, AUG_DIR)
+        first_logits[split_name] = embed_split(audio_net, audio_rows_[split_name], "audio", split_name, AUG_DIR)
+        window_logits[split_name] = mean_windows_for_split(
+            audio_net, split_name, first_logits[split_name], AUG_DIR
+        )
+    audio_logits = by_pooling[pooling]
+    module = run["modules"][chosen]
+    pairs = {
+        split_name: build_pairs(
+            split_name,
+            image_logits[split_name],
+            audio_logits[split_name],
+            image_rows[split_name],
+            audio_rows_[split_name],
+            exhaustive=True,
+        )
+        for split_name in ("calib", "test")
+    }
+    temperature = fit_temperature(chosen, module, pairs["calib"], image_logits["calib"], audio_logits["calib"])
+    calib_accuracy, calib_nll, _, _ = score(
+        chosen, module, pairs["calib"], image_logits["calib"], audio_logits["calib"], temperature
+    )
+    test_scores: dict[str, tuple[float, float]] = {}
+    test_labels: list[int] = []
+    test_predictions: list[int] = []
+    for name in ("image_only", "audio_only", "mean_prob"):
+        acc, nll_, _, _ = score(name, None, pairs["test"], image_logits["test"], audio_logits["test"])
+        test_scores[name] = (acc, nll_)
+    test_accuracy, test_nll, test_labels, test_predictions = score(
+        chosen, module, pairs["test"], image_logits["test"], audio_logits["test"], temperature
+    )
+    test_scores[chosen] = (test_accuracy, test_nll)
+    print(
+        f"TEST {chosen} audio={pooling} acc={test_accuracy:.6f} nll={test_nll:.6f} "
+        f"temperature={temperature:.1f} n={len(pairs['test'])}",
+        flush=True,
+    )
+
+    note = f"audio={pooling}"
+    new_rows = val_rows_for(run, True, "")
+    new_rows.append(comparison)
+    new_rows.append(
+        aug_row("calib", chosen, calib_accuracy, calib_nll, len(pairs["calib"]), temperature, f"adopted; temperature fit on calib; {note}")
+    )
+    for name, (acc, nll_) in test_scores.items():
+        label = f"adopted; scored once; {note}" if name == chosen else f"scored once; {note}"
+        test_temperature = temperature if name == chosen else 1.0
+        new_rows.append(aug_row("test", name, acc, nll_, len(pairs["test"]), test_temperature, label))
+
+    install_aug(
+        image_changed,
+        audio_changed,
+        module,
+        float(temperature),
+        pooling,
+        existing + new_rows,
+        test_labels,
+        test_predictions,
+    )
+    print("FUSION_ADOPTED", flush=True)
+
+
+def install_aug(
+    image_changed: bool,
+    audio_changed: bool,
+    module: nn.Module,
+    temperature: float,
+    pooling: str,
+    rows: list[dict[str, str]],
+    test_labels: list[int],
+    test_predictions: list[int],
+) -> None:
+    """Make the retrained checkpoints, logit caches, and fusion layer the live ones."""
+    for kind, changed in (("image", image_changed), ("audio", audio_changed)):
+        if changed:
+            shutil.copyfile(ROOT / "models" / f"{kind}_aug.pt", ROOT / "models" / f"{kind}_best.pt")
+    BACKUP_LOGIT_DIR.mkdir(parents=True, exist_ok=True)
+    for source in sorted(AUG_DIR.glob("*.npz")):
+        target = LOGIT_DIR / source.name
+        saved = BACKUP_LOGIT_DIR / source.name
+        if target.is_file() and not saved.is_file():
+            shutil.copyfile(target, saved)
+        shutil.copyfile(source, target)
+    write_species(test_labels, test_predictions, AUG_SPECIES_PATH)
+    write_species(test_labels, test_predictions)
+    write_results(rows)
+    torch.save(
+        {
+            "state_dict": module.state_dict(),
+            "system": "linear",
+            "temperature": temperature,
+            "audio_pooling": pooling,
+            "max_windows": train.MAX_AUDIO_WINDOWS,
+            "window_seconds": train.CLIP_SECONDS,
+        },
+        ROOT / "models" / "fusion_best.pt",
+    )
+
+
+REJECT_PATH = ROOT / "models" / "reject.json"
+REJECT_KEEP = 0.95
+
+
+def fused_confidence(
+    split_name: str, module: nn.Module, temperature: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fused confidence, photo confidence, and correctness for every same-species pair of a split."""
+    images = load_logit_cache("image", split_name)
+    audio = {sample_id: logits for sample_id, (logits, _count) in load_mean_window_logits(split_name).items()}
+    pairs = build_pairs(
+        split_name,
+        images,
+        audio,
+        rows_for_cache("image", split_name, images),
+        rows_for_cache("audio", split_name, audio),
+        exhaustive=True,
+    )
+    loader = DataLoader(PairSet(pairs, images, audio), batch_size=256, shuffle=False)
+    confidence: list[float] = []
+    photo: list[float] = []
+    correct: list[bool] = []
+    with torch.no_grad():
+        for image_batch, audio_batch, target in loader:
+            photo.extend(torch.softmax(image_batch, dim=1).max(dim=1).values.tolist())
+            probabilities = torch.softmax(module(image_batch, audio_batch) / temperature, dim=1)
+            top, index = probabilities.max(dim=1)
+            confidence.extend(top.tolist())
+            correct.extend((index == target).tolist())
+    return np.array(confidence), np.array(photo), np.array(correct)
+
+
+def fit_reject() -> None:
+    """Choose the confidence cuts below which the page says the species is not in the data.
+
+    Every calib pair is one of the 20 species, so each cut keeps REJECT_KEEP of them.
+    Two cuts: the highest fused probability, and the highest photo-only probability.
+    The recording model is too uncertain on its own to gate anything.
+    Test is not read. Val only reports how the cuts behave on pairs they were not fit on.
+    """
+    checkpoint = torch.load(ROOT / "models" / "fusion_best.pt", map_location="cpu", weights_only=False)
+    module = LogitFuse()
+    module.load_state_dict(checkpoint["state_dict"])
+    module.eval()
+    temperature = float(checkpoint["temperature"])
+    calib_fused, calib_photo, _ = fused_confidence("calib", module, temperature)
+    fused_cut = float(np.quantile(calib_fused, 1.0 - REJECT_KEEP))
+    photo_cut = float(np.quantile(calib_photo, 1.0 - REJECT_KEEP))
+    val_fused, val_photo, val_correct = fused_confidence("val", module, temperature)
+    accepted = (val_fused >= fused_cut) & (val_photo >= photo_cut)
+    summary = {
+        "metric": "highest fused probability and highest photo-only probability",
+        "threshold": round(fused_cut, 4),
+        "photo_threshold": round(photo_cut, 4),
+        "kept_of_known_species_each_cut": REJECT_KEEP,
+        "fit_on": f"calib, {len(calib_fused)} pairs from the 20 species",
+        "val_accepted_both_cuts": round(float(accepted.mean()), 4),
+        "val_accuracy_all": round(float(val_correct.mean()), 4),
+        "val_accuracy_accepted": round(float(val_correct[accepted].mean()), 4),
+        "val_accuracy_rejected": round(float(val_correct[~accepted].mean()), 4) if (~accepted).any() else None,
+        "note": "No bird outside the 20 species exists in the data, so the rate of catching one is not measured.",
+    }
+    REJECT_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2), flush=True)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "windows":
+    if len(sys.argv) > 1 and sys.argv[1] == "reject":
+        fit_reject()
+    elif len(sys.argv) > 1 and sys.argv[1] == "windows":
         evaluate_windows()
+    elif len(sys.argv) > 1 and sys.argv[1] == "rebuild":
+        rebuild("image" in sys.argv[2:], "audio" in sys.argv[2:])
     else:
         main()

@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -27,6 +28,9 @@ from train import (
     audio_mobilenet,
     audio_window_logits,
     image_model,
+    image_tensor_from_path,
+    mel_image_tensor,
+    mel_windows_from_path,
 )
 
 PORT = 8765
@@ -48,6 +52,11 @@ AUDIO_NET = None
 FUSION_NET = None
 TEMPERATURE = 1.0
 AUDIO_POOLING = "first_window"
+REJECT_PATH = ROOT / "models" / "reject.json"
+REJECT_BELOW = 0.0
+REJECT_PHOTO_BELOW = 0.0
+GATE_PATH = ROOT / "models" / "photo_gate.npz"
+PHOTO_GATE: dict | None = None
 WINDOW_LOGITS: dict[str, torch.Tensor] = {}
 WINDOW_COUNTS: dict[str, int] = {}
 
@@ -74,8 +83,18 @@ def load_catalog() -> None:
 
 
 def load_models() -> None:
-    global IMAGE_NET, AUDIO_NET, FUSION_NET, TEMPERATURE, AUDIO_POOLING
-    IMAGE_NET = image_model()
+    global IMAGE_NET, AUDIO_NET, FUSION_NET, TEMPERATURE, AUDIO_POOLING, REJECT_BELOW, REJECT_PHOTO_BELOW, PHOTO_GATE
+    PHOTO_GATE = None
+    if GATE_PATH.is_file():
+        stored = np.load(GATE_PATH)
+        PHOTO_GATE = {key: stored[key] for key in stored.files}
+    REJECT_BELOW = 0.0
+    REJECT_PHOTO_BELOW = 0.0
+    if REJECT_PATH.is_file():
+        cuts = json.loads(REJECT_PATH.read_text(encoding="utf-8"))
+        REJECT_BELOW = float(cuts["threshold"])
+        REJECT_PHOTO_BELOW = float(cuts["photo_threshold"])
+    IMAGE_NET = image_model(pretrained=False)
     image_checkpoint = torch.load(ROOT / "models" / "image_best.pt", map_location="cpu", weights_only=False)
     IMAGE_NET.load_state_dict(image_checkpoint["state_dict"])
     IMAGE_NET.eval()
@@ -125,20 +144,32 @@ def recorded_summary() -> dict[str, object]:
     window_test = ""
     val_fusion = ""
     window_val = ""
+    aug_test = ""
+    aug_val = ""
+    aug_image = ""
     with RESULTS_PATH.open(encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
+            adopted = row["note"].startswith("adopted")
             if row["stage"] == "test" and row["system"] == "linear":
                 test_accuracy = row["accuracy"]
             elif row["stage"] == "test" and row["system"] == "linear_windows":
                 window_test = row["accuracy"]
             elif row["stage"] == "val" and row["system"] == "linear":
                 val_fusion = row["accuracy"]
-            elif row["stage"] == "val" and row["system"] == "linear_windows" and row["note"].startswith("adopted"):
+            elif row["stage"] == "val" and row["system"] == "linear_windows" and adopted:
                 window_val = row["accuracy"]
+            elif row["stage"] == "test" and row["system"].endswith("_aug") and adopted:
+                aug_test = row["accuracy"]
+            elif row["stage"] == "val" and row["system"].endswith("_aug") and adopted:
+                aug_val = row["accuracy"]
+            elif row["stage"] == "val" and row["system"] == "image_only_aug":
+                aug_image = row["accuracy"]
             elif row["stage"] == "val" and row["system"] == "image_only":
                 summary["val_image"] = row["accuracy"]
-    summary["test_accuracy"] = window_test or test_accuracy
-    summary["val_fusion"] = window_val or val_fusion
+    summary["test_accuracy"] = aug_test or window_test or test_accuracy
+    summary["val_fusion"] = aug_val or window_val or val_fusion
+    if aug_val and aug_image:
+        summary["val_image"] = aug_image
     return summary
 
 
@@ -174,6 +205,44 @@ def ranking(probabilities: torch.Tensor, limit: int = 5) -> list[dict[str, objec
     ]
 
 
+def pack_prediction(
+    image_logits: torch.Tensor,
+    audio_logits: torch.Tensor,
+    n_windows: int,
+    file_species: dict[str, str] | None,
+    image_split: str,
+    audio_split: str,
+    photo_known: bool = True,
+) -> dict[str, object]:
+    fused_logits = FUSION_NET(image_logits, audio_logits)
+    fused_probabilities = torch.softmax(fused_logits / TEMPERATURE, dim=1)[0]
+    image_probabilities = torch.softmax(image_logits, dim=1)[0]
+    audio_probabilities = torch.softmax(audio_logits, dim=1)[0]
+    fused = top_call(fused_probabilities)
+    winner = int(fused["index"])
+    weight = FUSION_NET.fc.weight.detach()[winner]
+    image_part = float(torch.dot(weight[: len(LABELS)], image_logits[0]).item())
+    audio_part = float(torch.dot(weight[len(LABELS) :], audio_logits[0]).item())
+    bias = float(FUSION_NET.fc.bias.detach()[winner].item())
+    same_species = bool(file_species) and file_species["image"] == file_species["audio"]
+    return {
+        "fused": fused,
+        "image_only": top_call(image_probabilities),
+        "audio_only": top_call(audio_probabilities),
+        "ranking": ranking(fused_probabilities),
+        "known_species": float(fused["probability"]) >= REJECT_BELOW and photo_known,
+        "reject_below": REJECT_BELOW,
+        "contribution": {"image": image_part, "audio": audio_part, "bias": bias},
+        "temperature": TEMPERATURE,
+        "audio_pooling": AUDIO_POOLING,
+        "n_windows": n_windows,
+        "image_split": image_split,
+        "audio_split": audio_split,
+        "same_species_files": same_species,
+        "file_species": file_species,
+    }
+
+
 @torch.no_grad()
 def predict(image_id: str, audio_id: str) -> dict[str, object]:
     image_row = BY_ID.get(image_id)
@@ -199,33 +268,49 @@ def predict(image_id: str, audio_id: str) -> dict[str, object]:
         audio_tensor, _label = MelImageSet([audio_row], train=False)[0]
         audio_logits = AUDIO_NET(audio_tensor.unsqueeze(0))
         n_windows = 1
-    fused_logits = FUSION_NET(image_logits, audio_logits)
-    fused_probabilities = torch.softmax(fused_logits / TEMPERATURE, dim=1)[0]
-    image_probabilities = torch.softmax(image_logits, dim=1)[0]
-    audio_probabilities = torch.softmax(audio_logits, dim=1)[0]
-    fused = top_call(fused_probabilities)
-    winner = int(fused["index"])
-    weight = FUSION_NET.fc.weight.detach()[winner]
-    image_part = float(torch.dot(weight[: len(LABELS)], image_logits[0]).item())
-    audio_part = float(torch.dot(weight[len(LABELS) :], audio_logits[0]).item())
-    bias = float(FUSION_NET.fc.bias.detach()[winner].item())
-    return {
-        "fused": fused,
-        "image_only": top_call(image_probabilities),
-        "audio_only": top_call(audio_probabilities),
-        "ranking": ranking(fused_probabilities),
-        "contribution": {"image": image_part, "audio": audio_part, "bias": bias},
-        "temperature": TEMPERATURE,
-        "audio_pooling": AUDIO_POOLING,
-        "n_windows": n_windows,
-        "image_split": image_row["split"],
-        "audio_split": audio_row["split"],
-        "same_species_files": image_row["common_name"] == audio_row["common_name"],
-        "file_species": {
-            "image": image_row["common_name"],
-            "audio": audio_row["common_name"],
-        },
-    }
+    return pack_prediction(
+        image_logits,
+        audio_logits,
+        n_windows,
+        {"image": image_row["common_name"], "audio": audio_row["common_name"]},
+        image_row["split"],
+        audio_row["split"],
+    )
+
+
+def photo_view(image_tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Photo logits, and whether the photo looks like one of the 20 species."""
+    features = torch.flatten(IMAGE_NET.avgpool(IMAGE_NET.features(image_tensor.unsqueeze(0))), 1)
+    logits = IMAGE_NET.classifier(features)
+    if PHOTO_GATE is not None:
+        gate = PHOTO_GATE
+        scaled = (features[0].numpy() - gate["mean"]) / gate["scale"]
+        score = float(scaled @ gate["weights"] + gate["bias"])
+        return logits, score >= float(gate["cut"])
+    return logits, float(torch.softmax(logits, dim=1).max().item()) >= REJECT_PHOTO_BELOW
+
+
+@torch.no_grad()
+def check_photo(image_path: Path) -> dict[str, object]:
+    """Does this photo look like one of the 20 species? Uses the photo model alone."""
+    if IMAGE_NET is None:
+        raise RuntimeError("models are not loaded")
+    logits, known = photo_view(image_tensor_from_path(image_path))
+    top = top_call(torch.softmax(logits, dim=1)[0])
+    return {"known": known, "species": top["species"], "probability": top["probability"]}
+
+
+@torch.no_grad()
+def predict_files(image_path: Path, audio_path: Path) -> dict[str, object]:
+    if IMAGE_NET is None or AUDIO_NET is None or FUSION_NET is None:
+        raise RuntimeError("models are not loaded")
+    image_logits, photo_known = photo_view(image_tensor_from_path(image_path))
+    mels = mel_windows_from_path(audio_path)
+    if AUDIO_POOLING != "mean_windows":
+        mels = mels[:1]
+    batch = torch.stack([mel_image_tensor(mel) for mel in mels])
+    audio_logits = AUDIO_NET(batch).mean(dim=0, keepdim=True)
+    return pack_prediction(image_logits, audio_logits, len(mels), None, "upload", "upload", photo_known)
 
 
 class Handler(BaseHTTPRequestHandler):
