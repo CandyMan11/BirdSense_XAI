@@ -1,4 +1,4 @@
-"""Photo gate: is this photo one of the 20 species, or something else?
+﻿"""Photo gate: is this photo one of the 20 species, or something else?
 
 The photo model has no "none of these" answer, so a bald eagle still gets a
 species name. The gate is a small logistic regression on the photo model's
@@ -29,7 +29,7 @@ from train import LABEL_TO_INDEX, ROOT, image_tensor_from_path, read_split
 OOD_DIR = ROOT / "data" / "ood"
 GATE_PATH = ROOT / "models" / "photo_gate.npz"
 REPORT_PATH = ROOT / "models" / "photo_gate.json"
-KEEP = 0.90
+KEEP = 0.95
 PER_TAXON = 8
 
 # Species outside the 20, plus a few non-birds.

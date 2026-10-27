@@ -1,8 +1,5 @@
-<<<<<<< HEAD
 The titles were sitting inside a code block, so GitHub showed the `#` marks as plain text. Paste the text below into the README editor with no code fence around it. The `#` lines become the large titles.
 
-=======
->>>>>>> 7d14c4e (Add the Streamlit page)
 # BirdSense-XAI
 
 BirdSense-XAI classifies 20 bird species from a photo, a recording, or both. A photo model and a recording model are trained separately. A fusion layer then combines their scores. A local dashboard runs a single pair and shows which source the fused call followed.
@@ -132,8 +129,6 @@ Open http://127.0.0.1:8765. It needs the downloaded files plus `models/image_bes
 | `data/cache/` | Mel spectrograms and cached logits |
 
 `data/` is listed in `.gitignore`.
-<<<<<<< HEAD
-=======
 
 ## Deploy on Streamlit Community Cloud
 
@@ -144,4 +139,9 @@ The page needs no dataset. It reads the three saved models, models/reject.json, 
 3. Under Advanced settings, choose Python 3.10 (the version this was tested on).
 
 Run it locally with `streamlit run streamlit_app.py`. Uploads are limited to 50 MB. Birds outside the 20 species get a "Data not acquired" message; `python fuse.py reject` refits that cut after retraining.
->>>>>>> 7d14c4e (Add the Streamlit page)
+
+## Photos outside the 20 species
+
+The photo model always names one of its 20 species, so the page adds a gate. `photo_gate.py` fits a small logistic regression on the photo model's pooled features. It learns the 20 species from the train photos and "something else" from photos of 51 other species and non-birds (`python photo_gate.py download`, stored in `data/ood`, ignored by Git). `python photo_gate.py fit` writes `models/photo_gate.npz` and `models/photo_gate.json`; fitting needs `scikit-learn`, but running the page does not.
+
+The cut keeps about 95% of known photos on calib. When a species is held out of the fit, the gate catches about 44% of unlisted birds and 53% of non-birds, and keeps about 88% of known validation photos. A photo it flags gets a "doesn't belong in the dataset" message and no result. Look-alike birds can still pass. Test photos are not read.
